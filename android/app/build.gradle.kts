@@ -21,6 +21,10 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 26
         targetSdk = 35
+        // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
+        // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
+        // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
+        // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
@@ -46,4 +50,18 @@ flutter {
 
 dependencies {
     implementation("androidx.core:core:1.16.0")
+}
+
+// FOTO_MLKIT_R8_RULES
+android {
+    buildTypes {
+        getByName("release") {
+            proguardFiles("proguard-rules.pro")
+        }
+    }
+}
+
+// FOTO_WEAR_SYNC_DEPENDENCY
+dependencies {
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
 }

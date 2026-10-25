@@ -5,8 +5,9 @@ class ParsedEntry {
   final DateTime at;
   final String weekday;
   String title;
+  final int durationMinutes;
   bool selected = true;
-  ParsedEntry(this.at, this.weekday, this.title);
+  ParsedEntry(this.at, this.weekday, this.title, this.durationMinutes);
 }
 
 class _Row {
@@ -88,7 +89,10 @@ Future<List<ParsedEntry>> recognizePlan(String imagePath, DateTime now) async {
       final date = DateTime(now.year, now.month, now.day + distance, h1, m1);
       final rest = content.substring(foundTime.end).trim();
       final title = '${_clock(h1, m1)}–${_clock(h2, m2)}${rest.isEmpty ? '' : ' $rest'}';
-      parsed.add(ParsedEntry(date, currentWeekdayName, title));
+      // Account for appointments spanning midnight, e.g. 23:30-00:30.
+      final duration = ((h2 * 60 + m2) - (h1 * 60 + m1) + 1440) % 1440;
+      if (duration == 0) continue;
+      parsed.add(ParsedEntry(date, currentWeekdayName, title, duration));
       continue;
     }
     // Wrapped text belongs to preceding appointment if no new weekday starts.

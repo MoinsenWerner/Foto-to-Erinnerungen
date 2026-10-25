@@ -9,6 +9,9 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.MediaPlayer
@@ -38,46 +41,103 @@ object ReminderRuntime {
     private const val STORE = "foto_alarm_native"
     private const val ENTRIES = "entries"
     private const val CHANNEL_ID = "foto_alarms_v1"
+    private const val VIBRATE_CHANNEL_ID = "foto_alarms_vibrate_v1"
+    private const val NEXT_CHANNEL_ID = "foto_next_status_v1"
+    private const val NEXT_NOTIFICATION_ID = 990002
+    private const val NEXT_REFRESH_CODE = 990003
+    private const val STATUS_ENABLED = "show_next_notification"
+    private const val VIBRATE_ONLY = "vibrate_only"
+    private const val MAX_OFFSETS = 32
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(STORE, Context.MODE_PRIVATE)
     private fun alarms(ctx: Context) = ctx.getSystemService(AlarmManager::class.java)
-    private fun code(id: Int, index: Int): Int = id * 4 + index
+    // Unique for every reminder/offset pair (legacy id*4+index collided after 2 offsets).
+    private fun code(id: Int, index: Int): Int = "fte:$id:$index".hashCode()
+    private fun legacyCode(id: Int, index: Int): Int = id * 4 + index
 
     fun load(ctx: Context): JSONArray = try {
         JSONArray(prefs(ctx).getString(ENTRIES, "[]"))
     } catch (_: Exception) { JSONArray() }
 
-    fun saveAndReschedule(ctx: Context, entries: List<Map<String, Any?>>) {
+    fun saveAndReschedule(
+        ctx: Context, entries: List<Map<String, Any?>>,
+        showNextNotification: Boolean, vibrateOnly: Boolean
+    ) {
         val old = load(ctx)
         cancelAll(ctx, old)
         val json = JSONArray()
         for (entry in entries) json.put(JSONObject(entry))
-        prefs(ctx).edit().putString(ENTRIES, json.toString()).commit()
+        // Native persistence allows status updates when the Flutter UI is closed.
+        prefs(ctx).edit()
+            .putString(ENTRIES, json.toString())
+            .putBoolean(STATUS_ENABLED, showNextNotification)
+            .putBoolean(VIBRATE_ONLY, vibrateOnly)
+            .commit()
         reschedule(ctx, json)
-    }
-
-    fun reschedule(ctx: Context, entries: JSONArray = load(ctx)) {
-        for (i in 0 until entries.length()) {
-            val item = entries.optJSONObject(i) ?: continue
-            scheduleOffset(ctx, item, 0)
-            scheduleOffset(ctx, item, 1)
+        if (vibrateOnly) {
+            // Stop audio that may still be playing from an earlier alarm.
+            ctx.stopService(Intent(ctx, SoundService::class.java))
         }
     }
 
-    private fun cancelAll(ctx: Context, entries: JSONArray) {
+    fun isVibrateOnly(ctx: Context): Boolean = prefs(ctx).getBoolean(VIBRATE_ONLY, false)
+    private fun isNextEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean(STATUS_ENABLED, false)
+
+    fun reschedule(ctx: Context, entries: JSONArray = load(ctx)) {
+        // Cancel old-version alarms on upgrade or system restore.
         for (i in 0 until entries.length()) {
             val item = entries.optJSONObject(i) ?: continue
             val id = item.optInt("id")
             for (index in 0..1) {
+                val old = legacyPending(ctx, id, index)
+                if (old != null) {
+                    alarms(ctx).cancel(old)
+                    old.cancel()
+                }
+            }
+        }
+        for (i in 0 until entries.length()) {
+            val item = entries.optJSONObject(i) ?: continue
+            val count = minOf(MAX_OFFSETS, (item.optJSONArray("minutes") ?: JSONArray("[7,5]")).length())
+            for (index in 0 until count) scheduleOffset(ctx, item, index)
+        }
+        updateNextNotification(ctx)
+    }
+
+    private fun cancelAll(ctx: Context, entries: JSONArray) {
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        for (i in 0 until entries.length()) {
+            val item = entries.optJSONObject(i) ?: continue
+            val id = item.optInt("id")
+            val count = minOf(MAX_OFFSETS, (item.optJSONArray("minutes") ?: JSONArray("[7,5]")).length())
+            for (index in 0 until count) {
                 val pi = pending(ctx, id, index, false)
                 if (pi != null) {
                     alarms(ctx).cancel(pi)
                     pi.cancel()
                 }
-                (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                    .cancel(code(id, index))
+                manager.cancel(code(id, index))
+            }
+            // Cancel alarms created by earlier releases (id*4+index, index 0/1).
+            for (index in 0..1) {
+                val old = legacyPending(ctx, id, index)
+                if (old != null) {
+                    alarms(ctx).cancel(old)
+                    old.cancel()
+                }
+                manager.cancel(legacyCode(id, index))
             }
         }
+    }
+
+    private fun legacyPending(ctx: Context, id: Int, index: Int): PendingIntent? {
+        val intent = Intent(ctx, AlarmReceiver::class.java).apply {
+            action = "de.felix.foto_to_erinnerung.ALARM"
+            putExtra("id", id)
+            putExtra("index", index)
+        }
+        return PendingIntent.getBroadcast(ctx, legacyCode(id, index), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_NO_CREATE)
     }
 
     private fun pending(ctx: Context, id: Int, index: Int, create: Boolean): PendingIntent? {
@@ -102,7 +162,7 @@ object ReminderRuntime {
 
     fun scheduleOffset(ctx: Context, item: JSONObject, index: Int) {
         val minutes = item.optJSONArray("minutes") ?: JSONArray("[7,5]")
-        if (index >= minutes.length()) return
+        if (index < 0 || index >= MAX_OFFSETS || index >= minutes.length()) return
         val offset = minutes.optInt(index, if (index == 0) 7 else 5)
         val anchor = try { LocalDateTime.parse(item.getString("start")) } catch (_: Exception) { return }
         // Determine the next starting time AFTER (now + offset), so the trigger is in the future.
@@ -169,8 +229,140 @@ object ReminderRuntime {
         return null
     }
 
-    fun notification(ctx: Context, id: Int, index: Int, item: JSONObject): Notification {
-        ensureChannel(ctx)
+    // Separate, permanently quiet channel. It never uses the reminder's ringtone.
+    private fun ensureNextChannel(ctx: Context) {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            NEXT_CHANNEL_ID, "Nächste Erinnerungen", NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Ständige, lautlose Übersicht über die nächsten Termine"
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
+            setShowBadge(false)
+        }
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun refreshPending(ctx: Context): PendingIntent {
+        val intent = Intent(ctx, NextNotificationReceiver::class.java).apply {
+            action = "de.felix.foto_to_erinnerung.REFRESH_NEXT"
+        }
+        return PendingIntent.getBroadcast(
+            ctx, NEXT_REFRESH_CODE, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun nextItems(ctx: Context): List<Pair<ZonedDateTime, JSONObject>> {
+        val now = ZonedDateTime.now(ZoneId.systemDefault())
+        val found = mutableListOf<Pair<ZonedDateTime, JSONObject>>()
+        val entries = load(ctx)
+        for (i in 0 until entries.length()) {
+            val item = entries.optJSONObject(i) ?: continue
+            val anchor = try {
+                LocalDateTime.parse(item.getString("start"))
+            } catch (_: Exception) { continue }
+            var threshold = now.minusNanos(1)
+            // Also list multiple upcoming occurrences of a recurring reminder,
+            // not only the first occurrence of each reminder definition.
+            for (index in 0 until 4) {
+                val next = nextStart(item, anchor, threshold) ?: break
+                found.add(Pair(next, item))
+                if (!item.optBoolean("repeat", false)) break
+                threshold = next.plusNanos(1)
+            }
+        }
+        found.sortBy { it.first.toInstant() }
+        return found.take(4)
+    }
+
+    private fun formatStart(time: ZonedDateTime): String {
+        val format = SimpleDateFormat("EEE dd.MM. HH:mm", Locale.GERMAN)
+        return format.format(Date.from(time.toInstant()))
+    }
+
+    fun updateNextNotification(ctx: Context) {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        // Cancel the old refresh alarm before planning a new one.
+        val alarm = alarms(ctx)
+        val refresh = refreshPending(ctx)
+        alarm.cancel(refresh)
+        if (!isNextEnabled(ctx)) {
+            nm.cancel(NEXT_NOTIFICATION_ID)
+            return
+        }
+
+        val next = nextItems(ctx)
+        ensureNextChannel(ctx)
+        val open = PendingIntent.getActivity(
+            ctx, NEXT_NOTIFICATION_ID,
+            Intent(ctx, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val title = if (next.isEmpty()) "Keine anstehenden Erinnerungen"
+            else "${formatStart(next.first().first)} · ${next.first().second.optString("title", "Erinnerung")}"
+        // Separater Stil statt .apply: NotificationCompat.Style hat selbst eine apply()-Methode.
+        val inboxStyle = NotificationCompat.InboxStyle()
+        if (next.isEmpty()) {
+            inboxStyle.addLine("Keine anstehenden Erinnerungen")
+        } else {
+            for ((whenAt, item) in next) {
+                inboxStyle.addLine("${formatStart(whenAt)} · ${item.optString("title", "Erinnerung")}")
+            }
+        }
+
+        val notification = NotificationCompat.Builder(ctx, NEXT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setContentTitle("Nächste Erinnerungen")
+            .setContentText(title)
+            .setStyle(inboxStyle)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setShowWhen(false)
+            .build()
+        try {
+            nm.notify(NEXT_NOTIFICATION_ID, notification)
+        } catch (_: SecurityException) {
+            // On Android 13+ the user can deny POST_NOTIFICATIONS.
+        }
+
+        if (next.isNotEmpty()) {
+            // The previous appointment is no longer the next one at its start.
+            val whenMillis = max(
+                System.currentTimeMillis() + 1000L,
+                next.first().first.toInstant().toEpochMilli() + 1000L
+            )
+            try {
+                if (Build.VERSION.SDK_INT < 31 || alarm.canScheduleExactAlarms()) {
+                    alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenMillis, refresh)
+                } else {
+                    alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenMillis, refresh)
+                }
+            } catch (_: SecurityException) {
+                alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenMillis, refresh)
+            }
+        }
+    }
+
+    fun vibrate(ctx: Context) {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= 31)
+                ctx.getSystemService(VibratorManager::class.java).defaultVibrator
+            else (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator)
+            vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 200, 450), -1))
+        } catch (_: Exception) { }
+    }
+
+    fun notification(ctx: Context, id: Int, index: Int, item: JSONObject, silent: Boolean = false): Notification {
+        if (silent) ensureVibrateChannel(ctx) else ensureChannel(ctx)
         val openIntent = Intent(ctx, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -180,7 +372,7 @@ object ReminderRuntime {
         val stop = PendingIntent.getService(ctx, 0, stopIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val mins = item.optJSONArray("minutes")?.optInt(index) ?: if (index == 0) 7 else 5
-        return NotificationCompat.Builder(ctx, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(ctx, if (silent) VIBRATE_CHANNEL_ID else CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
             .setContentTitle(item.optString("title", "Erinnerung"))
             .setContentText("Beginnt in $mins Minuten")
@@ -189,8 +381,23 @@ object ReminderRuntime {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .addAction(android.R.drawable.ic_media_pause, "Ton stoppen", stop)
-            .build()
+        // The vibration-only channel has no sound and does vibrate, keeping
+        // heads-up behavior possible (setSilent(true) would prevent peeking).
+        if (!silent) builder.addAction(android.R.drawable.ic_media_pause, "Ton stoppen", stop)
+        return builder.build()
+    }
+
+    private fun ensureVibrateChannel(ctx: Context) {
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            VIBRATE_CHANNEL_ID, "Erinnerungen (nur Vibration)", NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Vorwarnungen mit Vibration, ohne Erinnerungs-Weckerton"
+            setSound(null, null)
+            enableVibration(true)
+            setVibrationPattern(longArrayOf(0, 450, 200, 450))
+        }
+        manager.createNotificationChannel(channel)
     }
 
     private fun ensureChannel(ctx: Context) {
@@ -207,10 +414,20 @@ class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         val id = intent.getIntExtra("id", -1)
         val index = intent.getIntExtra("index", -1)
-        if (id < 0 || index !in 0..1) return
+        if (id < 0 || index < 0 || index >= 32) return
         val entry = ReminderRuntime.find(ctx, id) ?: return
         // Schedule future occurrences before playing, including if the app stays closed.
         try { ReminderRuntime.scheduleOffset(ctx, entry, index) } catch (_: Exception) { }
+        if (ReminderRuntime.isVibrateOnly(ctx)) {
+            // Vibration-only alarms need no audio foreground service.
+            try {
+                ctx.getSystemService(NotificationManager::class.java).notify(
+                    "fte:$id:$index".hashCode(), ReminderRuntime.notification(ctx, id, index, entry, silent = true)
+                )
+            } catch (_: SecurityException) { }
+            // Android handles vibration via the high-priority silent-sound channel.
+            return
+        }
         val service = Intent(ctx, SoundService::class.java).apply {
             action = SoundService.PLAY
             putExtra("id", id)
@@ -222,7 +439,7 @@ class AlarmReceiver : BroadcastReceiver() {
             // Devices with restricted FGS execution still get a normal notification.
             try {
                 val manager = ctx.getSystemService(NotificationManager::class.java)
-                manager.notify(id * 4 + index, ReminderRuntime.notification(ctx, id, index, entry))
+                manager.notify("fte:$id:$index".hashCode(), ReminderRuntime.notification(ctx, id, index, entry))
             } catch (_: Exception) { }
         }
     }
@@ -237,6 +454,14 @@ class RestoreReceiver : BroadcastReceiver() {
             intent.action == AlarmManager.ACTION_SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED
         ) {
             ReminderRuntime.reschedule(ctx)
+        }
+    }
+}
+
+class NextNotificationReceiver : BroadcastReceiver() {
+    override fun onReceive(ctx: Context, intent: Intent) {
+        if (intent.action == "de.felix.foto_to_erinnerung.REFRESH_NEXT") {
+            ReminderRuntime.updateNextNotification(ctx)
         }
     }
 }
@@ -257,7 +482,16 @@ class SoundService : Service() {
         val id = intent?.getIntExtra("id", -1) ?: -1
         val index = intent?.getIntExtra("index", -1) ?: -1
         val item = ReminderRuntime.find(this, id)
-        if (item == null || index !in 0..1) { stopSelf(startId); return START_NOT_STICKY }
+        if (item == null || index < 0 || index >= 32 ||
+            index >= (item.optJSONArray("minutes") ?: JSONArray("[7,5]")).length()) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        if (ReminderRuntime.isVibrateOnly(this)) {
+            // State may have changed since the receiver was dispatched.
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val notification = ReminderRuntime.notification(this, id, index, item)
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -265,13 +499,8 @@ class SoundService : Service() {
             } else startForeground(990001, notification)
         } catch (_: Exception) { stopSelf(startId); return START_NOT_STICKY }
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(id * 4 + index, notification)
-        try {
-            val vibrator = if (Build.VERSION.SDK_INT >= 31)
-                getSystemService(VibratorManager::class.java).defaultVibrator
-            else (getSystemService(VIBRATOR_SERVICE) as Vibrator)
-            vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 200, 450), -1))
-        } catch (_: Exception) { }
+        manager.notify("fte:$id:$index".hashCode(), notification)
+        ReminderRuntime.vibrate(this)
         val sound = item.optString("soundValue", "")
         val type = item.optString("soundType", "default")
         try {

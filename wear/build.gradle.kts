@@ -1,0 +1,39 @@
+plugins {
+    id("com.android.application")
+    // Flutter 3.47+ uses Android Gradle Plugin 9 with built-in Kotlin.
+}
+
+android {
+    namespace = "de.felix.foto_to_erinnerung"
+    compileSdk = 36
+    defaultConfig {
+        applicationId = "de.felix.foto_to_erinnerung"
+        minSdk = 30
+        targetSdk = 35
+        versionCode = (findProperty("fteVersion")?.toString()?.toIntOrNull() ?: 1)
+        versionName = "1.0.$versionCode"
+    }
+    buildTypes {
+        getByName("release") {
+            // Match Flutter's stock Android release signing (debug key).
+            // If you configured another key for the phone, change BOTH modules.
+            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
+}
+
+// FTE_WEAR_JVM_17
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}

@@ -27,7 +27,22 @@ class MainActivity : FlutterActivity() {
                     when (call.method) {
                         "scheduleAll" -> {
                             val entries = call.argument<List<Map<String, Any?>>>("entries") ?: emptyList()
-                            ReminderRuntime.saveAndReschedule(this, entries)
+                            val showNext = call.argument<Boolean>("showNextNotification") ?: false
+                            val vibrateOnly = call.argument<Boolean>("vibrateOnly") ?: false
+                            ReminderRuntime.saveAndReschedule(this, entries, showNext, vibrateOnly)
+                            WearPhoneSync.publish(this, org.json.JSONArray().apply {
+                                entries.forEach { put(org.json.JSONObject(it)) }
+                            }.toString())
+                            result.success(null)
+                        }
+                        "refreshNextNotification" -> {
+                            ReminderRuntime.updateNextNotification(this)
+                            result.success(null)
+                        }
+                        "openNotificationSettings" -> {
+                            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                            })
                             result.success(null)
                         }
                         "canExactAlarms" -> {
@@ -72,6 +87,13 @@ class MainActivity : FlutterActivity() {
                     result.error("ANDROID", ex.message ?: "Android-Fehler", null)
                 }
             }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 9422) ReminderRuntime.updateNextNotification(this)
     }
 
     @Deprecated("Platform callback")

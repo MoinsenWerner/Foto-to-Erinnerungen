@@ -3,6 +3,19 @@
 # ONLY after a successful build. Java is deliberately neither checked nor installed.
 set -Eeuo pipefail
 
+WEAR_BUILD=false
+case "${1:-}" in
+  "") ;;
+  -wear) WEAR_BUILD=true ;;
+  -h|--help)
+    echo 'Aufruf: ./compile.sh [-wear]'
+    echo '  ohne Optionen: Handy-APK bauen'
+    echo '  -wear: Handy- und Pixel-Watch/Wear-OS-APK bauen (inkl. Sync)'
+    exit 0 ;;
+  *) echo "Unbekannte Option: $1" >&2; exit 2 ;;
+esac
+if (($# > 1)); then echo 'Zu viele Argumente.' >&2; exit 2; fi
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS_DIR="${FOTO_TOOLS_DIR:-/opt/foto-to-erinnerung-tools}"
 ANDROID_HOME="${ANDROID_HOME:-$TOOLS_DIR/android-sdk}"
@@ -116,6 +129,83 @@ dependencies {
 GRADLE
 fi
 
+# Synchronize phone reminder snapshots with paired Wear OS watches.
+if [[ -f "$gradle_kts" ]] && ! grep -Fq 'FOTO_WEAR_SYNC_DEPENDENCY' "$gradle_kts"; then
+  cat >> "$gradle_kts" <<'FOTO_WEAR_DEPS'
+
+// FOTO_WEAR_SYNC_DEPENDENCY
+dependencies {
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
+}
+FOTO_WEAR_DEPS
+elif [[ -f "$gradle_groovy" ]] && ! grep -Fq 'FOTO_WEAR_SYNC_DEPENDENCY' "$gradle_groovy"; then
+  cat >> "$gradle_groovy" <<'FOTO_WEAR_GROOVY'
+
+// FOTO_WEAR_SYNC_DEPENDENCY
+dependencies {
+    implementation 'com.google.android.gms:play-services-wearable:20.0.1'
+}
+FOTO_WEAR_GROOVY
+fi
+
+# Only register a dedicated watch Gradle module if the -wear option is used.
+if [[ "$WEAR_BUILD" == true ]]; then
+  [[ -f "$ROOT/wear/build.gradle.kts" ]] || fail 'Wear-OS-Modul fehlt.'
+  settings="$ROOT/android/settings.gradle.kts"
+  [[ -f "$settings" ]] || fail 'Für -wear wird android/settings.gradle.kts benötigt.'
+  if ! grep -Fq 'FOTO_WEAR_MODULE' "$settings"; then
+    cat >> "$settings" <<'FOTO_WEAR_SETTINGS'
+
+// FOTO_WEAR_MODULE
+include(":wear")
+project(":wear").projectDir = file("../wear")
+FOTO_WEAR_SETTINGS
+  fi
+  # AGP 9 includes Kotlin already, AGP 8 still needs the Kotlin plugin.
+  if ! grep -Eq 'com\.android\.application.*version "9\.' "$settings"; then
+    if ! grep -Fq 'id("org.jetbrains.kotlin.android")' "$ROOT/wear/build.gradle.kts"; then
+      sed -i '/id("com.android.application")/a\    id("org.jetbrains.kotlin.android")' "$ROOT/wear/build.gradle.kts"
+    fi
+  else
+    sed -i '/id("org.jetbrains.kotlin.android")/d' "$ROOT/wear/build.gradle.kts"
+  fi
+fi
+
+# FOTO_R8_MLKIT_START
+# Suppress missing optional ML Kit OCR languages for Latin-only recognition.
+mkdir -p "$ROOT/android/app"
+cp "$ROOT/android_overrides/app/proguard-rules.pro" "$ROOT/android/app/proguard-rules.pro"
+if [[ -f "$gradle_kts" ]]; then
+  if ! grep -Fq 'FOTO_MLKIT_R8_RULES' "$gradle_kts"; then
+    cat >> "$gradle_kts" <<'FOTO_KTS'
+
+// FOTO_MLKIT_R8_RULES
+android {
+    buildTypes {
+        getByName("release") {
+            proguardFiles("proguard-rules.pro")
+        }
+    }
+}
+FOTO_KTS
+  fi
+elif [[ -f "$gradle_groovy" ]]; then
+  if ! grep -Fq 'FOTO_MLKIT_R8_RULES' "$gradle_groovy"; then
+    cat >> "$gradle_groovy" <<'FOTO_GROOVY'
+
+// FOTO_MLKIT_R8_RULES
+android {
+    buildTypes {
+        release {
+            proguardFiles 'proguard-rules.pro'
+        }
+    }
+}
+FOTO_GROOVY
+  fi
+fi
+# FOTO_R8_MLKIT_END
+
 cat > "$ROOT/android/local.properties" <<PROPERTIES
 sdk.dir=$ANDROID_HOME
 flutter.sdk=$(dirname "$(dirname "$(readlink -f "$(command -v flutter)")")")
@@ -146,11 +236,37 @@ flutter pub get
 flutter build apk --release --build-name="1.0.$next" --build-number="$next"
 
 apk="$ROOT/build/app/outputs/flutter-apk/app-release.apk"
-[[ -s "$apk" ]] || fail 'Build meldete Erfolg, aber die APK ist nicht vorhanden.'
+[[ -s "$apk" ]] || fail 'Build meldete Erfolg, aber die Handy-APK ist nicht vorhanden.'
 file="$DEST_DIR/foto-to-erinnerung_v${next}.apk"
+watch_file="$DEST_DIR/foto-to-erinnerung_wear_v${next}.apk"
+if [[ "$WEAR_BUILD" == true ]]; then
+  log "Baue Wear-OS-APK für Pixel Watch 2 ..."
+  [[ -x "$ROOT/android/gradlew" ]] || fail 'Android Gradle Wrapper fehlt.'
+  (cd "$ROOT/android" && ./gradlew :wear:assembleRelease "-PfteVersion=$next")
+  watch_apk=''
+  for candidate in \
+    "$ROOT/build/wear/outputs/apk/release/wear-release.apk" \
+    "$ROOT/wear/build/outputs/apk/release/wear-release.apk"; do
+    if [[ -s "$candidate" ]]; then watch_apk="$candidate"; break; fi
+  done
+  [[ -n "$watch_apk" ]] || fail 'Wear-OS-Build erfolgreich, aber die Uhr-APK wurde nicht gefunden.'
+  # Google Play Services DataLayer requires IDENTICAL certificates on watch and phone.
+  apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+  [[ -x "$apksigner" ]] || fail 'apksigner fehlt im Android SDK.'
+  phone_cert="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)"
+  watch_cert="$("$apksigner" verify --print-certs "$watch_apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)"
+  [[ -n "$phone_cert" && "$phone_cert" == "$watch_cert" ]] || fail 'Unterschiedliche APK-Signaturen: DataLayer-Sync würde nicht funktionieren.'
+  cp "$watch_apk" "${watch_file}.tmp.$$"
+fi
 cp "$apk" "${file}.tmp.$$"
+# Move files only after BOTH builds and the signature check succeeded.
 mv "${file}.tmp.$$" "$file"
+if [[ "$WEAR_BUILD" == true ]]; then mv "${watch_file}.tmp.$$" "$watch_file"; fi
 printf '%s\n' "$next" > "${version_marker}.tmp.$$"
 mv "${version_marker}.tmp.$$" "$version_marker"
 log "ERFOLG: $file"
 ls -lh "$file"
+if [[ "$WEAR_BUILD" == true ]]; then
+  log "ERFOLG (Wear OS): $watch_file"
+  ls -lh "$watch_file"
+fi

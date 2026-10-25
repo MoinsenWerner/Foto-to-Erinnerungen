@@ -32,6 +32,7 @@
         </activity>
         <meta-data android:name="flutterEmbedding" android:value="2" />
         <receiver android:name=".AlarmReceiver" android:exported="false" />
+        <receiver android:name=".NextNotificationReceiver" android:exported="false" />
         <receiver android:name=".RestoreReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
